@@ -8,6 +8,7 @@ exception: while the project is below `1.0.0`, breaking changes bump the
 **minor** version, and they are called out as such.
 
 ## [Unreleased]
+- Feat/median price (#920).
 - Feat/set active (#918).
 - Feat/resolve ceiling (#917).
 - Feat/refund vault (#916).
