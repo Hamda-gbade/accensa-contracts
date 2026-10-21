@@ -61,6 +61,10 @@ exception: while the project is below `1.0.0`, breaking changes bump the
 - docs(governance): document the 4 public items in lib.rs (closes #746) (#850).
 - **Documentation (#756, #757, #761, #762):** Documented granular event payload fields and refund-vault APIs.
 
+- **Documentation (issues #766, #767, #768, #770): document exported struct fields.**
+  Added field-level rustdoc comments to `AnchorEvent`, `TransferEventPayload`,
+  `OptimisticProposal`, and `RefundVector`. No contract behavior or data shapes
+  changed.
 - **`multisig-account` (issue #413): daily spending limits for sub-threshold
   signers.** Governance can configure a per-token daily allowance for routine
   transfers authorized by fewer than the full threshold. Spending is tracked

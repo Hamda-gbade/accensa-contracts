@@ -92,10 +92,35 @@
 - [x] Document `settle`, `anchor`, `prune`, `pause` and `unpause` (#760)
   - `contracts/common/src/events.rs` — doc comments only, inside the lines #760 names and nowhere else in the file
 
+## Issue #766: rustdoc for `AnchorEvent`'s exported fields
+
+- [x] Document the public fields of `AnchorEvent` (#766)
+  - `contracts/receipt-anchor/src/lib.rs` — doc comments only; field, type, order and derives unchanged
+
+## Issue #767: rustdoc for `TransferEventPayload`'s exported fields
+
+- [x] Document the public fields of `TransferEventPayload` (#767)
+  - `contracts/common/src/events.rs` — doc comments only; amount and fee are in the asset's units
+
+## Issue #768: rustdoc for `OptimisticProposal`'s exported fields
+
+- [x] Document the public fields of `OptimisticProposal` (#768)
+  - `contracts/governance/src/optimistic.rs` — doc comments only; field, type, order and derives unchanged
+
 ## Issue #769: rustdoc for `FallbackDisputeRequestedEvent`'s 6 public fields
 
 - [x] Document `dispute_id`, `oracle`, `payment_ref`, `merchant`, `recipient` and `amount` (#769)
   - `contracts/refund-policy-vdf/src/fallback.rs` — doc comments only; field, type, order and derives unchanged, and no unit invented for `amount`
+
+## Issue #770: rustdoc for `RefundVector`'s exported fields
+
+- [x] Document the public fields of `RefundVector` (#770)
+  - `contracts/refund-vault/src/refund_vectors.rs` — doc comments only; field, type, order and derives unchanged
+
+## Issue #678: error arm for absent state in receipt-shard::has_live_records
+
+- [x] `has_live_records` returns `Result<bool, Error>` with `Error::NotInitialized` on missing state (#678)
+  - `contracts/receipt-shard/src/consolidation.rs` — returns typed error instead of unwrap on missing `StartBatchId` or `EndBatchId`
 
 ## Issue #650: Cover the reputation badge authority guard's two failure arms
 
