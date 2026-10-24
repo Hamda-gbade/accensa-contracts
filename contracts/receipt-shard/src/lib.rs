@@ -1,0 +1,391 @@
+#![no_std]
+
+//! `ReceiptShard` holds a bounded, contiguous range of `[start_batch_id,
+//! end_batch_id)` Merkle batch anchors for a `ReceiptAnchor` router.
+//!
+//! A shard trusts exactly one caller — the `router` address recorded at
+//! construction time — for every state-changing entry point. The router is
+//! the only party that can compute a valid `batch_id` for this shard, so a
+//! shard never re-derives or second-guesses routing decisions; it only
+//! enforces that writes land inside its own assigned range.
+
+use accensa_common::Error;
+use sha2::{Digest, Sha256};
+use soroban_sdk::{contract, contractimpl, contractmeta, contracttype, Address, BytesN, Env, Vec};
+
+contractmeta!(key = "name", val = "ReceiptShard");
+contractmeta!(key = "version", val = env!("CARGO_PKG_VERSION"));
+contractmeta!(
+    key = "repo",
+    val = "https://github.com/accensa/accensa-contracts"
+);
+contractmeta!(key = "commit", val = env!("GIT_SHA"));
+
+/// Storage keys for this shard's instance state and its per-batch records.
+#[contracttype]
+pub enum DataKey {
+    Router,
+    StartBatchId,
+    EndBatchId,
+    Batch(u64),
+    PrunedUpTo,
+    /// Accrued, unclaimed storage-pruning bounty per cleanup caller
+    /// (issue #395). Instance storage, keyed by the caller that evicted
+    /// expired batches.
+    PruneBounty(Address),
+    /// Health-diagnostic counters (issue #419), instance storage. See
+    /// [`diagnostics::ShardStats`].
+    ShardStats,
+    /// Whether this storage shard accepts state-changing operations.
+    /// Decommissioned shards retain their address for historical discovery but
+    /// no longer accept writes.
+    Active,
+}
+
+/// Structurally identical to `ReceiptAnchor::BatchRecord`. Soroban cross-contract
+/// calls decode by shape (field names, types, and order), not by Rust type
+/// identity, so the two independently defined structs stay wire-compatible as
+/// long as this shape doesn't drift from the router's copy.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRecord {
+    /// SHA-256 Merkle root over the batch's receipt leaves, as a raw 32-byte
+    /// digest (no application unit). Written by `anchor_batch` from the
+    /// router-supplied argument, and by `consolidation::insert_migrated_batch`
+    /// when a peer shard migrates the record; read by `verify_receipt`, which
+    /// compares a folded proof against it, and returned by `get_batch`.
+    pub root: BytesN<32>,
+    /// Number of receipt leaves in the batch — a count, not a token amount.
+    /// Written by `anchor_batch` from the router-supplied argument, and by
+    /// `consolidation::insert_migrated_batch` on migration; read as a leaf
+    /// total by `prune_batches` and `pruning::prune_expired_receipts`
+    /// (removed-leaves accounting), by `diagnostics` counters, and returned
+    /// by `get_batch`.
+    pub count: u32,
+    /// Lower bound of the receipt period this batch covers, as an opaque
+    /// caller-supplied `u64`: no shard code path interprets or validates it
+    /// against ledger time or sequence. Written verbatim by `anchor_batch`
+    /// from the router-supplied argument, and stored verbatim by
+    /// `consolidation::insert_migrated_batch`; read back only via `get_batch`.
+    pub period_start: u64,
+    /// Upper bound of the receipt period this batch covers, same opaque
+    /// caller-supplied `u64` domain as `period_start` — the shard stores it
+    /// without interpreting it. Written verbatim by `anchor_batch` from the
+    /// router-supplied argument, and stored verbatim by
+    /// `consolidation::insert_migrated_batch`; read back only via `get_batch`.
+    pub period_end: u64,
+    /// Soroban ledger sequence number (`env.ledger().sequence()`) at which
+    /// this record was anchored. Written by `anchor_batch` itself, not
+    /// supplied by the router, and carried over unchanged by
+    /// `consolidation::insert_migrated_batch`; read as an age bound by
+    /// `prune_batches` (`record.anchored_ledger < before_ledger`), by
+    /// `pruning::prune_expired_receipts` and `diagnostics::count_retained`
+    /// against `RETENTION_LEDGERS`, and returned by `get_batch`.
+    pub anchored_ledger: u32,
+}
+
+/// Approximately 30 days of ledgers, assuming ~5 seconds per ledger. Mirrors
+/// `ReceiptAnchor`'s TTL policy so shard-held batches archive on the same
+/// schedule as the router's own instance storage.
+const TTL_EXTEND: u32 = 518_400;
+const TTL_THRESHOLD: u32 = 100;
+
+/// Maximum valid Merkle proof length. Matches the router's `MAX_PROOF_LEN`.
+/// A batch of N leaves produces a tree of depth ⌈log₂(N)⌉. For
+/// MAX_BATCH_SIZE = 1000 (router constant), that is 10.
+const MAX_PROOF_LEN: u32 = 10;
+
+/// A storage shard: holds the batch records for one `[start_batch_id,
+/// end_batch_id)` slice of a router's batch stream. Every state-changing
+/// entry point authenticates the `router` address recorded at construction.
+#[contract]
+pub struct ReceiptShard;
+
+#[contractimpl]
+impl ReceiptShard {
+    /// Runs atomically with `deploy_v2`, so a shard is never observable in an
+    /// uninitialized state between deployment and setup.
+    pub fn __constructor(env: Env, router: Address, start_batch_id: u64, end_batch_id: u64) {
+        env.storage().instance().set(&DataKey::Router, &router);
+        env.storage()
+            .instance()
+            .set(&DataKey::StartBatchId, &start_batch_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::EndBatchId, &end_batch_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::PrunedUpTo, &start_batch_id);
+        env.storage().instance().set(&DataKey::Active, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+    }
+
+    /// Writes a batch anchored by the router. `batch_id` must fall in this
+    /// shard's assigned `[start, end)` range — the router is solely
+    /// responsible for computing that correctly, so a violation here means a
+    /// router bug, not a recoverable user error.
+    pub fn anchor_batch(
+        env: Env,
+        batch_id: u64,
+        root: BytesN<32>,
+        count: u32,
+        period_start: u64,
+        period_end: u64,
+    ) -> Result<(), Error> {
+        let active: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Active)
+            .ok_or(Error::NotInitialized)?;
+        if !active {
+            return Err(Error::Unauthorized);
+        }
+        let router: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Router)
+            .ok_or(Error::NotInitialized)?;
+        router.require_auth();
+
+        let start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StartBatchId)
+            .ok_or(Error::NotInitialized)?;
+        let end: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EndBatchId)
+            .ok_or(Error::NotInitialized)?;
+        if batch_id < start || batch_id >= end {
+            return Err(Error::BatchNotFound);
+        }
+
+        let record = BatchRecord {
+            root,
+            count,
+            period_start,
+            period_end,
+            anchored_ledger: env.ledger().sequence(),
+        };
+
+        let previous: Option<BatchRecord> =
+            env.storage().persistent().get(&DataKey::Batch(batch_id));
+        diagnostics::record_anchor(&env, batch_id, previous.as_ref(), count);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Batch(batch_id), &record);
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Batch(batch_id), TTL_THRESHOLD, TTL_EXTEND);
+        Ok(())
+    }
+
+    /// Reads this shard's record for `batch_id`. Read-only and
+    /// unauthenticated. Returns `Error::BatchNotFound` when the shard holds no
+    /// record for that id — because it was never anchored, or because
+    /// `prune_batches` already deleted it.
+    pub fn get_batch(env: Env, batch_id: u64) -> Result<BatchRecord, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Batch(batch_id))
+            .ok_or(Error::BatchNotFound)
+    }
+
+    pub fn verify_receipt(
+        env: Env,
+        batch_id: u64,
+        leaf: BytesN<32>,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<bool, Error> {
+        if proof.len() > MAX_PROOF_LEN {
+            return Err(Error::ProofTooLong);
+        }
+        let batch = Self::get_batch(env, batch_id)?;
+        let computed_hash = Self::fold_proof(leaf.to_array(), proof);
+
+        // Public-data comparison: both the folded proof and the stored Merkle
+        // root are public commitment data, so standard equality is intentional.
+        Ok(computed_hash == batch.root.to_array())
+    }
+
+    /// Folds a sorted-pair Merkle proof with one allocation-free guest loop.
+    /// Keeping the proof in its Soroban vector avoids copying it into a second
+    /// buffer and avoids a second traversal before hashing.
+    fn fold_proof(mut computed_hash: [u8; 32], proof: Vec<BytesN<32>>) -> [u8; 32] {
+        for sibling_bytes in proof.into_iter() {
+            let sibling = sibling_bytes.to_array();
+            let mut combined = [0u8; 64];
+            if computed_hash <= sibling {
+                combined[..32].copy_from_slice(&computed_hash);
+                combined[32..].copy_from_slice(&sibling);
+            } else {
+                combined[..32].copy_from_slice(&sibling);
+                combined[32..].copy_from_slice(&computed_hash);
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(combined);
+            computed_hash = hasher.finalize().into();
+        }
+        computed_hash
+    }
+
+    /// Extends the TTL of the batch record at `batch_id` so an unpruned record
+    /// stays live. Publicly callable, no auth and no caller precondition except
+    /// that the shard is still active (an inactive shard panics). Returns
+    /// `Error::BatchNotFound` when the shard holds no record for that id.
+    pub fn extend_batch_ttl(env: Env, batch_id: u64) -> Result<(), Error> {
+        assert!(Self::is_active(env.clone()), "shard is inactive");
+        if !env.storage().persistent().has(&DataKey::Batch(batch_id)) {
+            return Err(Error::BatchNotFound);
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Batch(batch_id), TTL_THRESHOLD, TTL_EXTEND);
+        Ok(())
+    }
+
+    /// Deletes batches from this shard's local `PrunedUpTo` cursor forward,
+    /// stopping at the first batch not yet old enough, `high_water_batch_id`
+    /// (never prune ahead of what the router has actually written), or
+    /// `max_batches` deletions — whichever comes first. Returns the advanced
+    /// cursor and how many batches were pruned, so the router can decide
+    /// whether to keep going within this shard or move to the next one.
+    ///
+    /// Returns `Error::NotInitialized` when the instance carries none of the
+    /// construction-time state this function reads — `Router`, `EndBatchId`
+    /// or `PrunedUpTo` — the state a caller observes before the shard is
+    /// constructed, or after the instance entry has aged out. A missing key
+    /// is reported as that typed error instead of aborting the host call.
+    ///
+    /// Router-gated: pruning order is a router-level invariant (a contiguous
+    /// global prefix), so only the router may advance this shard's cursor.
+    pub fn prune_batches(
+        env: Env,
+        before_ledger: u32,
+        max_batches: u32,
+        high_water_batch_id: u64,
+    ) -> Result<(u64, u64), Error> {
+        assert!(Self::is_active(env.clone()), "shard is inactive");
+        let router: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Router)
+            .ok_or(Error::NotInitialized)?;
+        router.require_auth();
+
+        let end_batch_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EndBatchId)
+            .ok_or(Error::NotInitialized)?;
+        let ceiling = high_water_batch_id.min(end_batch_id);
+
+        let mut cursor: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PrunedUpTo)
+            .ok_or(Error::NotInitialized)?;
+        let mut pruned: u64 = 0;
+        // Counters are settled once after the loop rather than per deletion.
+        // `pruned` also counts already-absent ids, which never held a record,
+        // so the stats deltas are tracked separately.
+        let mut removed_batches: u64 = 0;
+        let mut removed_leaves: u64 = 0;
+
+        while cursor < ceiling && pruned < max_batches as u64 {
+            match env
+                .storage()
+                .persistent()
+                .get::<_, BatchRecord>(&DataKey::Batch(cursor))
+            {
+                Some(record) if record.anchored_ledger < before_ledger => {
+                    env.storage().persistent().remove(&DataKey::Batch(cursor));
+                    removed_batches += 1;
+                    removed_leaves += record.count as u64;
+                    cursor += 1;
+                    pruned += 1;
+                }
+                Some(_) => break,
+                None => {
+                    cursor += 1;
+                    pruned += 1;
+                }
+            }
+        }
+
+        diagnostics::record_removals(&env, removed_batches, removed_leaves);
+
+        if pruned > 0 {
+            env.storage().instance().set(&DataKey::PrunedUpTo, &cursor);
+            env.storage()
+                .instance()
+                .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        }
+
+        Ok((cursor, pruned))
+    }
+
+    /// Returns the router address recorded at construction, or
+    /// `NotInitialized` when the instance has no router (never constructed,
+    /// or instance storage evicted after the durability window). A successful
+    /// read extends the instance TTL, matching the write paths.
+    pub fn get_router(env: Env) -> Result<Address, Error> {
+        let router: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Router)
+            .ok_or(Error::NotInitialized)?;
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        Ok(router)
+    }
+
+    /// Returns `(start_batch_id, end_batch_id)`, the shard's assigned
+    /// half-open range, or `NotInitialized` when the instance has no range
+    /// (never constructed, or instance storage evicted after the durability
+    /// window). A successful read extends the instance TTL, matching the
+    /// write paths.
+    pub fn get_range(env: Env) -> Result<(u64, u64), Error> {
+        let start: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::StartBatchId)
+            .ok_or(Error::NotInitialized)?;
+        let end: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EndBatchId)
+            .ok_or(Error::NotInitialized)?;
+        env.storage()
+            .instance()
+            .extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+        Ok((start, end))
+    }
+}
+
+pub mod consolidation;
+#[cfg(test)]
+mod consolidation_test;
+pub mod diagnostics;
+#[cfg(test)]
+mod diagnostics_test;
+#[cfg(test)]
+mod getter_test;
+pub mod pruning;
+#[cfg(test)]
+mod pruning_test;
+mod test;
+
+// Tier A soroban-budget-assert gates. Compiled only when the `budget-assert`
+// feature is enabled (the budget CI job), so the normal test/clippy runs stay
+// free of the prebuilt-WASM requirement and the `budget_macros` dependency.
+#[cfg(all(test, feature = "budget-assert"))]
+mod budget_test;
